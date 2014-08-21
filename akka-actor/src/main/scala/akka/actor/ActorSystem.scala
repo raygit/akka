@@ -6,6 +6,7 @@ package akka.actor
 
 import java.io.Closeable
 import java.util.concurrent.{ ConcurrentHashMap, ThreadFactory, CountDownLatch, TimeoutException, RejectedExecutionException }
+import java.util.concurrent.atomic.{ AtomicReference }
 import java.util.concurrent.TimeUnit.MILLISECONDS
 import com.typesafe.config.{ Config, ConfigFactory }
 import akka.event._
@@ -17,7 +18,7 @@ import akka.util._
 import scala.annotation.tailrec
 import scala.collection.immutable
 import scala.concurrent.duration.{ FiniteDuration, Duration }
-import scala.concurrent.{ Await, Awaitable, CanAwait, Future, ExecutionContext, ExecutionContextExecutor }
+import scala.concurrent.{ Await, Future, Promise, ExecutionContext, ExecutionContextExecutor }
 import scala.util.{ Failure, Success, Try }
 import scala.util.control.{ NonFatal, ControlThrowable }
 
@@ -390,12 +391,14 @@ abstract class ActorSystem extends ActorRefFactory {
    *
    * @throws TimeoutException in case of timeout
    */
+  @deprecated("Use Await.result(whenTerminated, timeout) instead", "2.4")
   def awaitTermination(timeout: Duration): Unit
 
   /**
    * Block current thread until the system has been shutdown. This will
    * block until after all on termination callbacks have been run.
    */
+  @deprecated("Use Await.result(whenTerminated, Duration.Inf) instead", "2.4")
   def awaitTermination(): Unit
 
   /**
@@ -404,6 +407,7 @@ abstract class ActorSystem extends ActorRefFactory {
    * (below which the logging actors reside) and the execute all registered
    * termination handlers (see [[ActorSystem.registerOnTermination]]).
    */
+  @deprecated("Use the terminate() method instead", "2.4")
   def shutdown(): Unit
 
   /**
@@ -413,7 +417,22 @@ abstract class ActorSystem extends ActorRefFactory {
    * returns `false`, the status is actually unknown, since it might have
    * changed since you queried it.
    */
+  @deprecated("Use the whenTerminated method instead.", "2.4")
   def isTerminated: Boolean
+
+  /**
+   * Terminates this actor system. This will stop the guardian actor, which in turn
+   * will recursively stop all its child actors, then the system guardian
+   * (below which the logging actors reside) and the execute all registered
+   * termination handlers (see [[ActorSystem.registerOnTermination]]).
+   */
+  def terminate(): Future[Unit]
+
+  /**
+   * Returns a Future which will be completed after the ActorSystem has been terminated
+   * and termination hooks have been executed.
+   */
+  def whenTerminated: Future[Unit]
 
   /**
    * Registers the provided extension and creates its payload, if this extension isn't already registered
@@ -525,7 +544,7 @@ private[akka] class ActorSystemImpl(val name: String, applicationConfig: Config,
               }
             } else {
               log.error(cause, "Uncaught fatal error from thread [{}] shutting down ActorSystem [{}]", thread.getName, name)
-              shutdown()
+              terminate()
             }
         }
       }
@@ -604,7 +623,9 @@ private[akka] class ActorSystemImpl(val name: String, applicationConfig: Config,
         override def reportFailure(t: Throwable): Unit = dispatcher reportFailure t
       })
 
-  def terminationFuture: Future[Unit] = provider.terminationFuture
+  private[this] final val terminationCallbacks = new TerminationCallbacks(provider.terminationFuture, dispatcher)
+
+  def whenTerminated: Future[Unit] = terminationCallbacks.terminationFuture
   def lookupRoot: InternalActorRef = provider.rootGuardian
   def guardian: LocalActorRef = provider.guardian
   def systemGuardian: LocalActorRef = provider.systemGuardian
@@ -623,29 +644,23 @@ private[akka] class ActorSystemImpl(val name: String, applicationConfig: Config,
     this
   } catch {
     case NonFatal(e) ⇒
-      try {
-        shutdown()
-      } catch { case NonFatal(_) ⇒ Try(stopScheduler()) }
+      try terminate() catch { case NonFatal(_) ⇒ Try(stopScheduler()) }
       throw e
   }
 
   def start(): this.type = _start
-
-  private lazy val terminationCallbacks = {
-    implicit val d = dispatcher
-    val callbacks = new TerminationCallbacks
-    terminationFuture onComplete (_ ⇒ callbacks.run)
-    callbacks
-  }
   def registerOnTermination[T](code: ⇒ T) { registerOnTermination(new Runnable { def run = code }) }
   def registerOnTermination(code: Runnable) { terminationCallbacks.add(code) }
-  def awaitTermination(timeout: Duration) { Await.ready(terminationCallbacks, timeout) }
-  def awaitTermination() = awaitTermination(Duration.Inf)
-  def isTerminated = terminationCallbacks.isTerminated
+  override def awaitTermination(timeout: Duration) { Await.ready(whenTerminated, timeout) }
+  override def awaitTermination() = awaitTermination(Duration.Inf)
+  override def isTerminated = whenTerminated.isCompleted
 
-  def shutdown(): Unit = {
+  override def shutdown(): Unit = terminate()
+
+  override def terminate(): Future[Unit] = {
     if (!settings.LogDeadLettersDuringShutdown) logDeadLetterListener foreach stop
     guardian.stop()
+    whenTerminated
   }
 
   @volatile var aborting = false
@@ -658,7 +673,7 @@ private[akka] class ActorSystemImpl(val name: String, applicationConfig: Config,
    */
   def abort(): Unit = {
     aborting = true
-    shutdown()
+    terminate()
   }
 
   //#create-scheduler
@@ -783,44 +798,37 @@ private[akka] class ActorSystemImpl(val name: String, applicationConfig: Config,
     printNode(lookupRoot, "")
   }
 
-  final class TerminationCallbacks extends Runnable with Awaitable[Unit] {
-    private val lock = new ReentrantGuard
-    private var callbacks: List[Runnable] = _ //non-volatile since guarded by the lock
-    lock withGuard { callbacks = Nil }
+  final class TerminationCallbacks(upStreamTerminated: Future[Unit], executionContext: ExecutionContext)
+    extends AtomicReference[List[Runnable]](Nil) with Runnable {
+    private[this] final val done = Promise[Unit]()
 
-    private val latch = new CountDownLatch(1)
+    upStreamTerminated.onComplete(_ ⇒ run())(executionContext) // Run the callbacks when upStream closes
 
-    final def add(callback: Runnable): Unit = {
-      latch.getCount match {
-        case 0 ⇒ throw new RejectedExecutionException("Must be called prior to system shutdown.")
-        case _ ⇒ lock withGuard {
-          if (latch.getCount == 0) throw new RejectedExecutionException("Must be called prior to system shutdown.")
-          else callbacks ::= callback
+    /**
+     * This Future will be completed when the upstream is completed and all callbacks have been executed.
+     */
+    def terminationFuture: Future[Unit] = done.future
+
+    /**
+     * Attempts to add the given Runnable to execute when the ActorSystem terminates.
+     * @throws RejectedExecutionException if the ActorSystem has already terminated.
+     * @param callback what to execute on termination
+     */
+    @tailrec final def add(callback: Runnable): Unit = get match {
+      case null ⇒ throw new RejectedExecutionException("Must be called prior to system shutdown.")
+      case list ⇒ if (compareAndSet(list, callback :: list)) () else add(callback)
+    }
+
+    final def run(): Unit = getAndSet(null) match {
+      case null ⇒ ()
+      case callbacks ⇒
+        @tailrec def runNext(c: List[Runnable]): Unit = c match {
+          case Nil ⇒ ()
+          case callback :: rest ⇒
+            try callback.run() catch { case NonFatal(e) ⇒ log.error(e, "Failed to run termination callback, due to [{}]", e.getMessage) }
+            runNext(rest)
         }
-      }
+        done complete Try(runNext(callbacks))
     }
-
-    final def run(): Unit = lock withGuard {
-      @tailrec def runNext(c: List[Runnable]): List[Runnable] = c match {
-        case Nil ⇒ Nil
-        case callback :: rest ⇒
-          try callback.run() catch { case NonFatal(e) ⇒ log.error(e, "Failed to run termination callback, due to [{}]", e.getMessage) }
-          runNext(rest)
-      }
-      try { callbacks = runNext(callbacks) } finally latch.countDown()
-    }
-
-    final def ready(atMost: Duration)(implicit permit: CanAwait): this.type = {
-      if (atMost.isFinite()) {
-        if (!latch.await(atMost.length, atMost.unit))
-          throw new TimeoutException("Await termination timed out after [%s]" format (atMost.toString))
-      } else latch.await()
-
-      this
-    }
-
-    final def result(atMost: Duration)(implicit permit: CanAwait): Unit = ready(atMost)
-
-    final def isTerminated: Boolean = latch.getCount == 0
   }
 }
